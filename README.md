@@ -28,7 +28,7 @@ Once all information has been provided, I can use the “File->Save” menu to s
 
 Conceptually, a QuickTime movie contains multiple “tracks” of media data, such as video, audio and subtitle. It also has information about the movie (i.e. metadata), such as its title, release date, genre, etc.
 
-All these information and data are stored in a “.mov” file conforming to the QuickTime File Format (QTFF) Specification. You can find it [here]. In a nutshell, the movie file is organized using “atoms” (also referred to as “boxes”). The QTFF Specification defines the purpose and structure of each atom.
+All these information and data are stored in a “.mov” file conforming to the QuickTime File Format (QTFF) Specification. You can find it [here](https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFPreface/qtffPreface.html). In a nutshell, the movie file is organized using “atoms” (also referred to as “boxes”). The QTFF Specification defines the purpose and structure of each atom.
 
 I won’t get into too much low-level details here. However, if you are interested in understanding why certain code was written that way, I recommend that you at least read these sections.
 
@@ -42,7 +42,7 @@ I won’t get into too much low-level details here. However, if you are interest
 
 Movie editing on Apple devices is usually done by using AVFoundation classes such as AVAssetReader, AVAssetWriter, AVVideoCompoistion, etc. These classes classes provide powerful low-level controls over how you manipulate the movie, but for my simple purpose of adding chapter markers they are a little overkill.
 
-In [WWDC15 #506 - Editing Movies in AV Foundation], Tim Monroe showcased how to use the new [AVMutableMovie] and [AVMutableMovieTrack] classes to edit QuickTime movie files. Although 7 years have passed, I could found almost no example code using these “new” classes!
+In [WWDC15 #506 - Editing Movies in AV Foundation](https://developer.apple.com/videos/play/wwdc2015/506/), Tim Monroe showcased how to use the new [AVMutableMovie](https://developer.apple.com/documentation/avfoundation/avmutablemovie) and [AVMutableMovieTrack](https://developer.apple.com/documentation/avfoundation/avmutablemovietrack) classes to edit QuickTime movie files. Although 7 years have passed, I could found almost no example code using these “new” classes!
 
 I found this strange, given how easy it is to use these new classes. For example, with AVMutableMovieTrack, keeping sections of the movie is as simple as a call to its `insertTimeRange(_,of:,at:,copySampleData:) ` function.
 
@@ -50,9 +50,9 @@ Anyway, we will be using these new classes! Hopefully someone later will find th
 
 ## Code Snippets
 
-Apple’s AVFoundation API presents chapter information from an **existing** movie file as an array of AVTimedMetadataGroup objects (see documentation [here]). This created some confusion as I found multiple people (I was guilty too) trying to write chapter information as metadata using AVTimedMetadataGroup. This is incorrect.
+Apple’s AVFoundation API presents chapter information from an **existing** movie file as an array of AVTimedMetadataGroup objects (see documentation [here](https://developer.apple.com/documentation/avfoundation/media_playback/presenting_chapter_markers)). This created some confusion as I found multiple people (I was guilty too) trying to write chapter information as metadata using AVTimedMetadataGroup. This is incorrect.
 
-My breakthrough started from reading the “[Track References]” and “[Chapter Lists]” sections in the QTFF Specification. The chapter markers should be added as a “text” track, and referenced by the “video” track using reference type “chap”. Apple’s API simply reads these tracks and present them as the timed metadata group array.
+My breakthrough started from reading the “[Track References](https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap3/qtff3.html#//apple_ref/doc/uid/TP40000939-CH205-BBCIBFHE)” and “[Chapter Lists](https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap3/qtff3.html#//apple_ref/doc/uid/TP40000939-CH205-57863)” sections in the QTFF Specification. The chapter markers should be added as a “text” track, and referenced by the “video” track using reference type “chap”. Apple’s API simply reads these tracks and present them as the timed metadata group array.
 
 Besides adding text (as chapter titles), you can also add images (as chapter thumbnails). This is not mentioned in the specification but can be done similarly. The chapter title need to be added as a “text” track, and the thumbnail image need to be add as a “video” track containing still images.
 
