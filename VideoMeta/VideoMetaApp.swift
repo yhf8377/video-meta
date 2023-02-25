@@ -41,12 +41,11 @@ struct VideoMetaApp: App {
     }
     
     private func loadVideo(from url: URL?) {
-        self.video.url = url
+        guard let assetUrl = url else { return }
+        self.video.url = assetUrl
         
-        if var assetUrl = url {
-            assetUrl.deleteLastPathComponent()
-            self.lastOpenLocation = assetUrl
-        }
+        let openLocation = assetUrl.deletingLastPathComponent()
+        self.lastOpenLocation = openLocation
     }
     
     private func exportCommand() {
@@ -55,6 +54,9 @@ struct VideoMetaApp: App {
         panel.canSelectHiddenExtension = true
         panel.isExtensionHidden = false
         panel.directoryURL = self.lastSaveLocation
+        let title = self.video.title.count > 0 ? self.video.title : "Movie"
+        let releaseYear = self.video.releaseDate.count >= 4 ? String(self.video.releaseDate.prefix(4)) : String(Calendar.current.component(.year, from: Date()))
+        panel.nameFieldStringValue = "\(title) (\(releaseYear)).mov"
         panel.allowedContentTypes = [.quickTimeMovie]
         panel.begin(completionHandler: { (response) in
             if response == NSApplication.ModalResponse.OK {
@@ -66,13 +68,15 @@ struct VideoMetaApp: App {
     private func exportVideo(to url: URL?) {
         guard let exportUrl = url else { return }
         self.video.exportProgress = 0.0
+        self.video.exportMessage = "Exporting ..."
+        self.video.exportError = false
         self.video.exporting = true
-        
+
         Task {
             let exporter = VideoExport(video: self.video)
             await exporter.export(to: exportUrl, progressHandler: updateExportProgress, completionHandler: markExportPAsComplete, errorHandler: notifyExportError)
         }
-        
+
         let saveLocation = exportUrl.deletingLastPathComponent()
         self.lastSaveLocation = saveLocation
     }
@@ -86,6 +90,11 @@ struct VideoMetaApp: App {
     }
 
     private func notifyExportError(_ message: String) {
-        self.video.exporting = false
+        self.video.exportError = true
+        self.video.exportMessage = message
+        Timer.scheduledTimer(withTimeInterval: 10.0, repeats: false) { timer in
+            self.video.exporting = false
+            timer.invalidate()
+        }
     }
 }

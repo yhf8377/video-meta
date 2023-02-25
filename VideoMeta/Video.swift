@@ -36,15 +36,25 @@ class CMTimeFormatter: Formatter {
         }
     }
 
-    override func getObjectValue(_ obj: AutoreleasingUnsafeMutablePointer<AnyObject?>?, for string: String, errorDescription error: AutoreleasingUnsafeMutablePointer<NSString?>?) -> Bool {
-        let components = string.split(separator: ":")
+    func fromString(_ string: String) -> CMTime? {
+        let components = string.replacingOccurrences(of: ",", with: ".").split(separator: ":")
         if components.count == 3 {
-            guard let hours = Double(components[0]) else { return false }
-            guard let minutes = Double(components[1]) else { return false }
-            guard let seconds = Double(components[2]) else { return false }
+            guard let hours = Double(components[0]) else { return nil }
+            guard let minutes = Double(components[1]) else { return nil }
+            guard let seconds = Double(components[2]) else { return nil }
 
             let time = CMTime(seconds: hours * 3600 + minutes * 60 + seconds, preferredTimescale: 1000)
-            obj?.pointee = time as AnyObject
+            return time
+        }
+        else {
+            return nil
+        }
+    }
+
+    override func getObjectValue(_ obj: AutoreleasingUnsafeMutablePointer<AnyObject?>?,
+                                 for string: String, errorDescription error: AutoreleasingUnsafeMutablePointer<NSString?>?) -> Bool {
+        if let value = fromString(string) {
+            obj?.pointee = value as AnyObject
             return true
         }
         else {
@@ -109,9 +119,16 @@ class VideoInfo: ObservableObject {
     var cast: String = ""
     var description: String = ""
 
-    private var _subtitleFile: URL? = nil
-    var subtitleFile: String {
-        get { return self._subtitleFile != nil ? self._subtitleFile!.absoluteString : "" }
+    private var _subtitleFileUrl: URL? = nil
+    var subtitleFileUrl: URL? {
+        get { return _subtitleFileUrl }
+    }
+    var subtitleFileName: String {
+        get { return self._subtitleFileUrl != nil ? self._subtitleFileUrl!.lastPathComponent : "" }
+        set {
+            _subtitleFileUrl = URL(fileURLWithPath: newValue)
+            self.objectWillChange.send()
+        }
     }
 
     @Published var chapters: [Chapter] = []
@@ -140,7 +157,9 @@ class VideoInfo: ObservableObject {
     }
 
     @Published var exporting: Bool = false
+    @Published var exportError: Bool = false
     @Published var exportProgress: Float = 0.0
+    @Published var exportMessage: String = "Exporting ..."
 
     func findChapterIndex(for id: Chapter.ID?) -> Int? {
         return id != nil ? chapters.firstIndex(where: { $0.id == id }) : nil
@@ -199,7 +218,7 @@ class VideoInfo: ObservableObject {
         self._screenshotTime = .invalid
         self._screenshotData = nil
         self._screenshotImage = nil
-        self._subtitleFile = nil
+        self._subtitleFileUrl = nil
 
         if let url = assetUrl {
             let asset = AVAsset(url: url)
@@ -233,10 +252,6 @@ class VideoInfo: ObservableObject {
                     self.addChapter(at: .zero, with: "")
                 }
             }
-        }
-
-        Task {
-            await self.inspectVideoAsset(self.asset!)
         }
     }
 
@@ -341,24 +356,5 @@ class VideoInfo: ObservableObject {
         guard let item = metadataItem.first else { return nil }
         guard let value = try? await item.load(.dataValue) else { return nil }
         return value
-    }
-
-    private func inspectVideoAsset(_ asset: AVAsset) async {
-        guard let (tracks, trackGroups) = try? await asset.load(.tracks, .trackGroups) else { return }
-        print("Asset contains \(tracks.count) tracks and \(trackGroups.count) track groups.")
-        for track in tracks {
-            let trackID = track.trackID
-            guard let (formatDesc, timeRange, enabled) = try? await track.load(.formatDescriptions, .timeRange, .isEnabled) else { continue }
-            print("Track \(trackID) [\(timeRange.start.seconds)-\(timeRange.end.seconds)] (enabled=\(enabled)):")
-            for (index, format) in formatDesc.enumerated() {
-                let type = format.mediaType.description
-                let subType = format.mediaSubType.description
-                print("    Media Type (\(index)): \(type)/\(subType)")
-            }
-        }
-        for (index, group) in trackGroups.enumerated() {
-            let trackIDs = group.trackIDs.map { return $0.stringValue }
-            print("track group \(index) contains track \(trackIDs.joined(separator: ", "))")
-        }
     }
 }

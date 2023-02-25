@@ -13,6 +13,7 @@
 		0178591F2983174E00275B7B /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 0178591E2983174E00275B7B /* Preview Assets.xcassets */; };
 		0178592729831AAC00275B7B /* Video.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0178592629831AAC00275B7B /* Video.swift */; };
 		01D3CA262995627800CD774A /* VideoExport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01D3CA252995627800CD774A /* VideoExport.swift */; };
+		01E0473D29A9540E008D286A /* SubtitleAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01E0473C29A9540E008D286A /* SubtitleAdapter.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -24,6 +25,7 @@
 		017859202983174E00275B7B /* VideoMeta.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = VideoMeta.entitlements; sourceTree = "<group>"; };
 		0178592629831AAC00275B7B /* Video.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Video.swift; sourceTree = "<group>"; };
 		01D3CA252995627800CD774A /* VideoExport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoExport.swift; sourceTree = "<group>"; };
+		01E0473C29A9540E008D286A /* SubtitleAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubtitleAdapter.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -63,6 +65,7 @@
 				0178591B2983174E00275B7B /* Assets.xcassets */,
 				017859202983174E00275B7B /* VideoMeta.entitlements */,
 				0178591D2983174E00275B7B /* Preview Content */,
+				01E0473C29A9540E008D286A /* SubtitleAdapter.swift */,
 			);
 			path = VideoMeta;
 			sourceTree = "<group>";
@@ -148,6 +151,7 @@
 				0178591A2983174C00275B7B /* ContentView.swift in Sources */,
 				01D3CA262995627800CD774A /* VideoExport.swift in Sources */,
 				0178592729831AAC00275B7B /* Video.swift in Sources */,
+				01E0473D29A9540E008D286A /* SubtitleAdapter.swift in Sources */,
 				017859182983174C00275B7B /* VideoMetaApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

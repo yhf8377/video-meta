@@ -9,6 +9,7 @@ import SwiftUI
 import AVKit
 
 struct VideoInfoView: View {
+    @AppStorage("lastOpenLocation") var lastOpenLocation: URL?
     @ObservedObject var video: VideoInfo
     
     var body: some View {
@@ -42,9 +43,25 @@ struct VideoInfoView: View {
                     .frame(maxHeight: 120)
                     Spacer()
                     HStack {
-                        Text(video.subtitleFile)
+                        Text(video.subtitleFileName)
                         Spacer()
                         Button("Add Subtitle") {
+                            let panel = NSOpenPanel()
+                            panel.canChooseDirectories = false
+                            panel.allowsMultipleSelection = false
+                            if let srtType = UTType(filenameExtension: "srt") { panel.allowedContentTypes = [srtType] }
+                            panel.allowsOtherFileTypes = true
+                            panel.directoryURL = lastOpenLocation
+                            panel.begin(completionHandler: { (response) in
+                                if response == NSApplication.ModalResponse.OK {
+                                    guard let subtitleUrl = panel.url else { return }
+
+                                    let openLocation = subtitleUrl.deletingLastPathComponent()
+                                    self.lastOpenLocation = openLocation
+
+                                    self.video.subtitleFileName = subtitleUrl.path()
+                                }
+                            })
                         }
                     }
                 }
@@ -124,10 +141,10 @@ struct ContentView: View {
                 .disabled(video.asset == nil || video.exporting)
 
                 if video.exporting {
-                    ProgressView("Exporting...", value: video.exportProgress)
+                    ProgressView(video.exportMessage, value: video.exportProgress)
                         .progressViewStyle(.linear)
                         .padding(50.0)
-                        .background(.blue)
+                        .background(video.exportError ? .red : .blue)
                 }
             }
             HStack {

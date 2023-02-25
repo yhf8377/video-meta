@@ -70,17 +70,20 @@ actor VideoExport {
 
     func export(to exportUrl: URL, progressHandler: (@MainActor (Float) -> Void)? = nil, completionHandler: (@MainActor () -> Void)? = nil, errorHandler: (@MainActor (String) -> Void)? = nil) async {
         do {
-            // remove destination file if already exists
-            if FileManager.default.fileExists(atPath: exportUrl.path(percentEncoded: false)) {
-                try FileManager.default.removeItem(at: exportUrl)
+            // create temporary storage
+            let temporaryUrl = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            FileManager.default.createFile(atPath: temporaryUrl.path(), contents: nil)
+            defer {
+                try? FileManager.default.removeItem(at: temporaryUrl)
             }
 
             // create movie objects
             guard let assetUrl = _videoInfo.url else { throw VideoExportError.invalidAsset }
-            let sourceMovie = AVMovie(url: assetUrl, options: [AVURLAssetPreferPreciseDurationAndTimingKey : true])
-            try sourceMovie.writeHeader(to: exportUrl, fileType: .mov, options: .truncateDestinationToMovieHeaderOnly)
+            let sourceMovie = AVMutableMovie(url: assetUrl, options: [AVURLAssetPreferPreciseDurationAndTimingKey : true])
+            guard let (tracks, sourceDuration) = try? await sourceMovie.load(.tracks, .duration) else { throw VideoExportError.failedLoadingAssetProperty }
+
             guard let newMovie = try? AVMutableMovie(settingsFrom: sourceMovie, options: [AVURLAssetPreferPreciseDurationAndTimingKey : true]) else { throw VideoExportError.failedCreatingNewMovie }
-            newMovie.defaultMediaDataStorage = AVMediaDataStorage(url: exportUrl)
+            newMovie.defaultMediaDataStorage = AVMediaDataStorage(url: temporaryUrl)
 
             // prepare metadata
             newMovie.metadata = prepareMetadata(from: _videoInfo)
@@ -88,62 +91,128 @@ actor VideoExport {
             // find important tracks to keep
             var sourceTracks: [AVMovieTrack] = []
             var newTracks: [AVMutableMovieTrack] = []
-            guard let (tracks, sourceDuration) = try? await sourceMovie.load(.tracks, .duration) else { throw VideoExportError.failedLoadingAssetProperty }
             for track in tracks {
                 guard let format = try await track.load(.formatDescriptions).first else { throw VideoExportError.failedLoadingAssetProperty }
                 let keep = (format.mediaType == .video && format.mediaSubType != .jpeg) || (format.mediaType == .audio) || (format.mediaType == .subtitle)
                 if keep {
                     guard let newTrack = newMovie.addMutableTrack(withMediaType: track.mediaType, copySettingsFrom: track) else { throw VideoExportError.failedCreatingNewTrack }
+                    switch track.mediaType {
+                    case .audio:
+                        newTrack.alternateGroupID = 1
+                    case .subtitle:
+                        newTrack.alternateGroupID = 2
+                    default:
+                        newTrack.alternateGroupID = 0
+                    }
                     sourceTracks.append(track)
                     newTracks.append(newTrack)
                 }
             }
 
-            // process chapter definitions
+            // only produce chapter tracks when there are more than just the default chapter that was created automatically
+            guard let videoTrack = try? await newMovie.loadTracks(withMediaType: .video).first else { throw VideoExportError.failedCreatingNewTrack }
+            var chapterTrack: AVMutableMovieTrack? = nil
+            var thumbnailTrack: AVMutableMovieTrack? = nil
             if _videoInfo.chapters.count > 1 {
-                guard let videoTrack = try? await newMovie.loadTracks(withMediaType: .video).first else { throw VideoExportError.failedCreatingNewTrack }
+                chapterTrack = newMovie.addMutableTrack(withMediaType: .text, copySettingsFrom: nil)
+                thumbnailTrack = newMovie.addMutableTrack(withMediaType: .video, copySettingsFrom: nil)
+                if chapterTrack == nil || thumbnailTrack == nil { throw VideoExportError.failedCreatingNewTrack }
+            }
 
-                guard let chapterTrack = newMovie.addMutableTrack(withMediaType: .text, copySettingsFrom: nil) else { throw VideoExportError.failedCreatingNewTrack }
-                guard let thumbnailTrack = newMovie.addMutableTrack(withMediaType: .video, copySettingsFrom: nil) else { throw VideoExportError.failedCreatingNewTrack }
+            // only produce subtitle tracks when a new subtitle file was specified
+            var subtitleTrack: AVMutableMovieTrack? = nil
+            var subtitleParser: SubtitleParser? = nil
+            if _videoInfo.subtitleFileUrl != nil {
+                subtitleTrack = newMovie.addMutableTrack(withMediaType: .subtitle, copySettingsFrom: nil)
+                subtitleParser = SRTSubtitle(with: _videoInfo.subtitleFileUrl!)
+                if subtitleTrack == nil { throw VideoExportError.failedCreatingNewTrack }
+                let pattern = /_([a-z]{2}-[A-Z]{2})\.srt/       // match patterns like 'en-US' at the end of the file name
+                if let match = _videoInfo.subtitleFileUrl!.path().firstMatch(of: pattern) {
+                    subtitleTrack?.extendedLanguageTag = "\(match.1)"
+                }
+            }
 
-                var newTimeline: CMTime = .zero
-                for (index, chapter) in _videoInfo.chapters.enumerated() {
-                    let nextChapter = (index < _videoInfo.chapters.count-1 ? _videoInfo.chapters[index+1] : nil)
-                    let chapterDuration = (nextChapter != nil ? nextChapter!.time - chapter.time : sourceDuration - chapter.time)
-                    if chapter.keep {
-                        let timeRange = CMTimeRange(start: newTimeline, duration: chapterDuration)
-                        newTimeline = newTimeline + chapterDuration
+            // process chapter definitions
+            var newTimeline: CMTime = .zero
+            for (index, chapter) in _videoInfo.chapters.enumerated() {
+                let nextChapter = (index < _videoInfo.chapters.count-1 ? _videoInfo.chapters[index+1] : nil)
+                let chapterDuration = (nextChapter != nil ? nextChapter!.time - chapter.time : sourceDuration - chapter.time)
+                if chapter.keep || _videoInfo.chapters.count <= 1 {
+                    let oldRange = CMTimeRange(start: chapter.time, duration: chapterDuration)
+                    let newRange = CMTimeRange(start: newTimeline, duration: chapterDuration)
 
-                        // insert matching time range from source movie
-                        for (index, sourceTrack) in sourceTracks.enumerated() {
-                            let newTrack = newTracks[index]
-                            try newTrack.insertTimeRange(timeRange, of: sourceTrack, at: timeRange.start, copySampleData: true)
-                        }
-
-                        // add chapter track
-                        try await appendChapterSample(to: chapterTrack, for: chapter, on: timeRange)
-                        try await appendThumbnailSample(to: thumbnailTrack, for: chapter, on: timeRange)
+                    // insert matching time range from source movie
+                    for (index, sourceTrack) in sourceTracks.enumerated() {
+                        let newTrack = newTracks[index]
+                        try newTrack.insertTimeRange(oldRange, of: sourceTrack, at: newRange.start, copySampleData: true)
 
                         // update export progress
-                        let progress = Float((chapter.time + chapterDuration).seconds / sourceDuration.seconds)
+                        let progress = Float((chapter.time.seconds + chapterDuration.seconds / Double(sourceTracks.count)) / sourceDuration.seconds)
                         await progressHandler?(progress)
                     }
+
+                    // add to chapter track
+                    if chapterTrack != nil { try await appendChapterSample(to: chapterTrack!, for: chapter, on: newRange) }
+                    if thumbnailTrack != nil { try await appendThumbnailSample(to: thumbnailTrack!, for: chapter, on: newRange) }
+
+                    // add to subtitle track
+                    if subtitleTrack != nil && subtitleParser != nil {
+                        let offset = newRange.start - oldRange.start
+                        let subtitleLines = subtitleParser!.getLines(for: oldRange, withOffset: offset)
+                        var empty = SubtitleLine(startTime: newRange.start, endTime: newRange.end, text: "")
+                        if subtitleLines.count > 0 {
+                            for (index, line) in subtitleLines.enumerated() {
+                                empty.endTime = line.startTime
+                                // fill leading gap with an empty sample
+                                try await appendSubtitleSample(to: subtitleTrack!, for: empty, on: CMTimeRange(start: empty.startTime, end: empty.endTime))
+                                // write current subtitle line sample
+                                try await appendSubtitleSample(to: subtitleTrack!, for: line, on: CMTimeRange(start: line.startTime, end: line.endTime))
+                                empty.startTime = line.endTime
+                                if (index == subtitleLines.endIndex) {
+                                    // fill trailing gap with an empty sample
+                                    empty.endTime = newRange.end
+                                    try await appendSubtitleSample(to: subtitleTrack!, for: empty, on: CMTimeRange(start: empty.startTime, end: empty.endTime))
+                                }
+                            }
+                        }
+                        else {
+                            // when no subtitle line was found for current chapter range, fill entire range with an empty sample
+                            try await appendSubtitleSample(to: subtitleTrack!, for: empty, on: CMTimeRange(start: empty.startTime, end: empty.endTime))
+                        }
+                    }
+
+                    // ready timeline for next iteration
+                    newTimeline = newTimeline + chapterDuration
                 }
-
-                chapterTrack.insertMediaTimeRange(CMTimeRange(start: .zero, duration: newTimeline), into: CMTimeRange(start: .zero, duration: newTimeline))
-                thumbnailTrack.insertMediaTimeRange(CMTimeRange(start: .zero, duration: newTimeline), into: CMTimeRange(start: .zero, duration: newTimeline))
-
-                videoTrack.addTrackAssociation(to: chapterTrack, type: .chapterList)
-                videoTrack.addTrackAssociation(to: thumbnailTrack, type: .chapterList)
-
-                chapterTrack.isEnabled = false
-                thumbnailTrack.isEnabled = false
-            }
-            else {
-                try newMovie.insertTimeRange(CMTimeRange(start: .zero, duration: sourceDuration), of: sourceMovie, at: .zero, copySampleData: true)
             }
 
-            try newMovie.writeHeader(to: exportUrl, fileType: .mov, options: .addMovieHeaderToDestination)
+            if chapterTrack != nil {
+                chapterTrack!.insertMediaTimeRange(CMTimeRange(start: .zero, duration: newTimeline), into: CMTimeRange(start: .zero, duration: newTimeline))
+                videoTrack.addTrackAssociation(to: chapterTrack!, type: .chapterList)
+                chapterTrack!.isEnabled = false
+            }
+
+            if thumbnailTrack != nil {
+                thumbnailTrack!.insertMediaTimeRange(CMTimeRange(start: .zero, duration: newTimeline), into: CMTimeRange(start: .zero, duration: newTimeline))
+                videoTrack.addTrackAssociation(to: thumbnailTrack!, type: .chapterList)
+                thumbnailTrack!.isEnabled = false
+            }
+
+            if subtitleTrack != nil {
+                subtitleTrack!.insertMediaTimeRange(CMTimeRange(start: .zero, duration: newTimeline), into: CMTimeRange(start: .zero, duration: newTimeline))
+            }
+
+            try newMovie.writeHeader(to: temporaryUrl, fileType: .mov, options: .addMovieHeaderToDestination)
+            await progressHandler?(1.0)
+
+            // remove destination file if already exists
+            if FileManager.default.fileExists(atPath: exportUrl.path(percentEncoded: false)) {
+                try FileManager.default.removeItem(at: exportUrl)
+            }
+
+            // copy temporary file to final location
+            try FileManager.default.moveItem(at: temporaryUrl, to: exportUrl)
+
             await completionHandler?()
         }
         catch {
@@ -164,31 +233,37 @@ actor VideoExport {
         try appendNewSample(from: sampleData, format: formatDesc, timing: timeRange, to: track)
     }
 
-private func appendNewSample(from sampleData: Data, format sampleFormat: CMFormatDescription, timing timeRange: CMTimeRange, to track: AVMutableMovieTrack) throws {
-    guard let blockBuffer = sampleData.toBlockBuffer() else {
-        throw VideoExportError.failedCreatingSampleBuffer
+    private func appendSubtitleSample(to track: AVMutableMovieTrack, for subtitle: SubtitleLine, on timeRange: CMTimeRange) async throws {
+        guard let formatDesc = try? createSubtitleFormatDescription() else { throw VideoExportError.failedCreatingFormatDescription }
+        guard let sampleData = try? createSampleData(from: subtitle) else { throw VideoExportError.failedPreparingSampleData }
+        try appendNewSample(from: sampleData, format: formatDesc, timing: timeRange, to: track)
     }
-    var blockBufferLength = CMBlockBufferGetDataLength(blockBuffer)
 
-    var sampleTiming = CMSampleTimingInfo(duration: timeRange.duration,
-                                          presentationTimeStamp: timeRange.start,
-                                          decodeTimeStamp: .invalid)
+    private func appendNewSample(from sampleData: Data, format sampleFormat: CMFormatDescription, timing timeRange: CMTimeRange, to track: AVMutableMovieTrack) throws {
+        guard let blockBuffer = sampleData.toBlockBuffer() else {
+            throw VideoExportError.failedCreatingSampleBuffer
+        }
+        var blockBufferLength = CMBlockBufferGetDataLength(blockBuffer)
 
-    // create sample buffer
-    var sampleBuffer: CMSampleBuffer? = nil
-    if kCVReturnSuccess != CMSampleBufferCreateReady(
-        allocator: kCFAllocatorDefault,
-        dataBuffer: blockBuffer,
-        formatDescription: sampleFormat,
-        sampleCount: 1,
-        sampleTimingEntryCount: 1,
-        sampleTimingArray: &sampleTiming,
-        sampleSizeEntryCount: 1,
-        sampleSizeArray: &blockBufferLength,
-        sampleBufferOut: &sampleBuffer) || sampleBuffer == nil { throw VideoExportError.failedCreatingSampleBuffer }
+        var sampleTiming = CMSampleTimingInfo(duration: timeRange.duration,
+                                              presentationTimeStamp: timeRange.start,
+                                              decodeTimeStamp: .invalid)
 
-    try track.append(sampleBuffer!, decodeTime: nil, presentationTime: nil)
-}
+        // create sample buffer
+        var sampleBuffer: CMSampleBuffer? = nil
+        if kCVReturnSuccess != CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: blockBuffer,
+            formatDescription: sampleFormat,
+            sampleCount: 1,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &sampleTiming,
+            sampleSizeEntryCount: 1,
+            sampleSizeArray: &blockBufferLength,
+            sampleBufferOut: &sampleBuffer) || sampleBuffer == nil { throw VideoExportError.failedCreatingSampleBuffer }
+
+        try track.append(sampleBuffer!, decodeTime: nil, presentationTime: nil)
+    }
 
     private func createTextFormatDescription() throws -> CMFormatDescription? {
         // prepare sample description (reference: https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap3/qtff3.html#//apple_ref/doc/uid/TP40000939-CH205-BBCJAJEA)
@@ -272,6 +347,44 @@ private func appendNewSample(from sampleData: Data, format sampleFormat: CMForma
         return formatDesc
     }
 
+    private func createSubtitleFormatDescription() throws -> CMFormatDescription? {
+        // prepare sample description (reference: https://developer.apple.com/library/archive/documentation/QuickTime/QTFF/QTFFChap3/qtff3.html#//apple_ref/doc/uid/TP40000939-CH205-BBCJAJEA)
+        let subtitleDescription: Array<UInt8> = [
+            0x00, 0x00, 0x00, 0x40,                         // 32-bit size (total sample description size 64 bytes)
+            0x74, 0x78, 0x33, 0x67,                         // 32-bit sample type ('tx3g')
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // 48-bit reserved
+            0x00, 0x01,                                     // 16-bit data reference index
+            0x20, 0x00, 0x00, 0x00,                         // 32-bit display flags
+            0x00,                                           // 8-bit reserved (must set to 1)
+            0xFF,                                           // 8-bit reserved (must set to -1)
+            0x00, 0x00, 0x00, 0x00,                         // 32-bit reserved (must set to 0)
+            0x03, 0x96, 0x00, 0x00, 0x04, 0x38, 0x07, 0x80, // 64-bit default text box
+            0x00, 0x00, 0x00, 0x00,                         // 32-bit reserved (must set to 0)
+            0x00, 0x01,                                     // 16-bit font number
+            0x00,                                           // 8-bit font face
+            0x18,                                           // 8-bit font size
+            0xFF, 0xFF, 0xFF, 0xFF,                         // 32-bit foreground color
+            // Font Table Atom
+            0x00, 0x00, 0x00, 0x12,                         // 32-bit size (font table atom size 18 bytes)
+            0x66, 0x74, 0x61, 0x62,                         // 32-bit atom type ('ftab')
+            0x00, 0x01,                                     // 16-bit count (must be 1)
+            0x00, 0x01,                                     // 16-bit font identifier
+            0x05,                                           // 8-bit font name length
+            0x41, 0x72, 0x69, 0x61, 0x6C                    // font name ('Arial')
+        ]
+
+        var formatDesc: CMTextFormatDescription? = nil
+        try subtitleDescription.withUnsafeBytes() { ptr in
+            if kCVReturnSuccess != CMTextFormatDescriptionCreateFromBigEndianTextDescriptionData(allocator: kCFAllocatorDefault,
+                                                                                                 bigEndianTextDescriptionData: ptr.baseAddress!,
+                                                                                                 size: subtitleDescription.count,
+                                                                                                 flavor: nil,
+                                                                                                 mediaType: kCMMediaType_Subtitle,
+                                                                                                 formatDescriptionOut: &formatDesc) { throw VideoExportError.failedCreatingFormatDescription }
+        }
+        return formatDesc
+    }
+
     private func createSampleData(from text: String) throws -> Data {
         struct TextEncodingModifierAtom {
             let size: UInt32
@@ -311,6 +424,25 @@ private func appendNewSample(from sampleData: Data, format sampleFormat: CMForma
         return jpegData
     }
 
+    private func createSampleData(from subtitle: SubtitleLine) throws -> Data {
+        guard let utf8Data = subtitle.text.data(using: .utf8) else { throw VideoExportError.failedPreparingSampleData }
+        let dataLengthBigEndian = CFSwapInt16HostToBig(UInt16(utf8Data.count))
+
+        // block buffer size is a 16-bit integer (size) plus the legnth of the text (without terminating null-byte) and the encoding modifier atom
+        let dataOffset = MemoryLayout<UInt16>.size
+        let bufferLength = MemoryLayout<UInt16>.size + utf8Data.count
+        if (bufferLength > UInt16.max) { throw VideoExportError.failedCreatingBlockBuffer }
+
+        // construct sample data
+        var sampleData = Data(count: bufferLength)
+        sampleData.replaceSubrange(dataOffset..<bufferLength, with: utf8Data)
+        sampleData.withUnsafeMutableBytes { ptr in
+            ptr.storeBytes(of: dataLengthBigEndian, as: UInt16.self)
+        }
+
+        return sampleData
+    }
+
     private func prepareMetadata(from video: VideoInfo) -> [AVMetadataItem] {
         var metadata: [AVMetadataItem] = []
 
@@ -323,9 +455,13 @@ private func appendNewSample(from sampleData: Data, format sampleFormat: CMForma
 
         // metadata for release date
         if video.releaseDate.count > 0 {
-            metadata.append(createMetadata(for: .commonIdentifierCreationDate, in: .common, using: .commonKeyCreationDate, with: video.releaseDate))
-            metadata.append(createMetadata(for: .iTunesMetadataReleaseDate, in: .iTunes, using: .iTunesMetadataKeyReleaseDate, with: video.releaseDate))
-            metadata.append(createMetadata(for: AVMetadataIdentifier("itsk/©day"), in: AVMetadataKeySpace("itsk"), using: AVMetadataKey("©day"), with: video.releaseDate))
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd"
+            if let date = formatter.date(from: video.releaseDate) {
+                metadata.append(createMetadata(for: .commonIdentifierCreationDate, in: .common, using: .commonKeyCreationDate, with: date))
+                metadata.append(createMetadata(for: .iTunesMetadataReleaseDate, in: .iTunes, using: .iTunesMetadataKeyReleaseDate, with: date))
+                metadata.append(createMetadata(for: AVMetadataIdentifier("itsk/©day"), in: AVMetadataKeySpace("itsk"), using: AVMetadataKey("©day"), with: date))
+            }
         }
 
         // metadata for title
@@ -385,6 +521,15 @@ private func appendNewSample(from sampleData: Data, format sampleFormat: CMForma
         metaItem.key = key as NSString
         metaItem.identifier = identifier
         metaItem.value = stringValue as NSString
+        return metaItem
+    }
+
+    private func createMetadata(for identifier: AVMetadataIdentifier, in space: AVMetadataKeySpace, using key: AVMetadataKey, with dateValue: Date) -> AVMutableMetadataItem {
+        let metaItem = AVMutableMetadataItem()
+        metaItem.keySpace = space
+        metaItem.key = key as NSString
+        metaItem.identifier = identifier
+        metaItem.value = dateValue as NSDate
         return metaItem
     }
 
