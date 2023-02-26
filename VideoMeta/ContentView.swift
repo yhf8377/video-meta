@@ -10,44 +10,49 @@ import AVKit
 
 struct VideoInfoView: View {
     @AppStorage("lastOpenLocation") var lastOpenLocation: URL?
-    @ObservedObject var video: VideoInfo
+    @ObservedObject var appState: AppState
     
     var body: some View {
         GroupBox(label: Label("Video Info", systemImage: "video")) {
             HStack(alignment: .top) {
-                Image(nsImage: video.poster)
+                Image(nsImage: appState.videoInfo.poster)
                     .resizable()
                     .scaledToFit()
                     .frame(width: 180.0, height: 240.0)
                     .border(.gray)
                     .dropDestination(for: Data.self) { items, position in
-                        if (video.asset == nil) { return false }
+                        if (appState.videoInfo.asset == nil) { return false }
                         
                         guard let data = items.first else { return false }
                         guard let image = NSImage(data: data) else {return false }
-                        video.poster = image
+                        appState.videoInfo.poster = image
                         return true
                     }
                 VStack {
                     HStack {
-                        TextField("Identifier", text: $video.identifier).frame(width: 100)
-                        TextField("Release Date", text: $video.releaseDate).frame(width: 100)
+                        TextField("Identifier", text: $appState.videoInfo.identifier).frame(width: 100)
+                        TextField("Release Date", text: $appState.videoInfo.releaseDate).frame(width: 100)
                         Spacer()
                     }
-                    TextField("Title", text: $video.title)
-                    TextField("Cast", text: $video.cast)
-                    TextField("Genre", text: $video.genre)
+                    TextField("Title", text: $appState.videoInfo.title)
+                    TextField("Cast", text: $appState.videoInfo.cast)
+                    TextField("Genre", text: $appState.videoInfo.genre)
                     ScrollView {
-                        TextField("Description", text: $video.description, axis: .vertical)
+                        TextField("Description", text: $appState.videoInfo.description, axis: .vertical)
                             .lineLimit(50, reservesSpace: true)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                     .frame(maxHeight: 70.0)
                     Spacer()
-                    Text(video.subtitleFileName)
                     HStack {
-                        Toggle("Replace existing subtitle", isOn: $video.replaceExistingSubtitle)
-                            .disabled(video.subtitleFileUrl == nil)
+                        Text(appState.subtitleFileName).disabled(true)
+                        Spacer()
+                        Text("Time Adjustment:")
+                        TextField("Time Adjustment", text: $appState.subtitleTimeAdjustment).frame(width: 50)
+                    }
+                    HStack {
+                        Toggle("Replace existing subtitle", isOn: $appState.replaceExistingSubtitle)
+                            .disabled(appState.subtitleFileUrl == nil)
                         Spacer()
                         Button("Add Subtitle") {
                             let panel = NSOpenPanel()
@@ -59,11 +64,10 @@ struct VideoInfoView: View {
                             panel.begin(completionHandler: { (response) in
                                 if response == NSApplication.ModalResponse.OK {
                                     guard let subtitleUrl = panel.url else { return }
+                                    appState.subtitleFileUrl = subtitleUrl
 
                                     let openLocation = subtitleUrl.deletingLastPathComponent()
                                     self.lastOpenLocation = openLocation
-
-                                    self.video.subtitleFileName = subtitleUrl.path()
                                 }
                             })
                         }
@@ -75,14 +79,14 @@ struct VideoInfoView: View {
 }
 
 struct ChaptersListView: View {
-    @ObservedObject var video: VideoInfo
+    @ObservedObject var appState: AppState
 
     private let timeFormatter = CMTimeFormatter()
 
     var body: some View {
         GroupBox(label: Label("Chapter Info", systemImage: "photo.on.rectangle")) {
             VStack {
-                List($video.chapters, selection: $video.selectedChapterID) { $chapter in
+                List($appState.videoInfo.chapters, selection: $appState.selectedChapterID) { $chapter in
                     HStack {
                         Image(nsImage: chapter.image)
                             .resizable()
@@ -101,16 +105,20 @@ struct ChaptersListView: View {
                             TextField("chapter title", text: $chapter.title)
                                 .onSubmit {
                                     var genres: Set<String> = []
-                                    if self.video.genre.count > 0 {
-                                        genres = genres.union(self.video.genre.components(separatedBy: "/").map { return $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+                                    if appState.videoInfo.genre.count > 0 {
+                                        genres = genres.union(appState.videoInfo.genre.components(separatedBy: "/").map {
+                                            return $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        })
                                     }
-                                    for chapter in self.video.chapters {
+                                    for chapter in appState.videoInfo.chapters {
                                         if chapter.title.count > 0 {
-                                            let chapterTitles = chapter.title.components(separatedBy: "/").map { return $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                            let chapterTitles = chapter.title.components(separatedBy: "/").map {
+                                                return $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                                            }
                                             genres = genres.union(chapterTitles)
                                         }
                                     }
-                                    self.video.genre = genres.joined(separator: "/")
+                                    appState.videoInfo.genre = genres.joined(separator: "/")
                                 }
                             Toggle("Export", isOn: $chapter.keep)
                                 .frame(maxWidth: .infinity, alignment: .trailing)
@@ -120,13 +128,21 @@ struct ChaptersListView: View {
                 Spacer()
                 HStack {
                     Button("+", action: {
-                        let time = video.playbackTime
-                        video.addChapter(at: time, with: "")
-                    }).disabled(video.asset == nil)
+                        Task {
+                            let time = appState.playbackTime
+                            if let chapter = await appState.createChapter(at: time, with: "") {
+                                DispatchQueue.main.async {
+                                    // insert new chapter in sorted order
+                                    let index = appState.videoInfo.chapters.firstIndex(where: { $0.time > time }) ?? appState.videoInfo.chapters.endIndex
+                                    appState.videoInfo.chapters.insert(chapter, at: index)
+                                }
+                            }
+                        }
+                    }).disabled(appState.videoInfo.asset == nil)
                     Button("-", action: {
-                        guard let index = video.selectedChapterIndex else { return }
-                        if index > 0 { video.chapters.remove(at: index) }
-                    }).disabled(video.asset == nil || video.selectedChapterIndex == nil || video.selectedChapterIndex == 0)
+                        guard let index = appState.selectedChapterIndex else { return }
+                        if index > 0 && index < appState.videoInfo.chapters.endIndex { appState.videoInfo.chapters.remove(at: index) }
+                    }).disabled(appState.videoInfo.asset == nil || appState.selectedChapterID == nil || appState.selectedChapterIndex == 0)
                     Spacer()
                 }
             }
@@ -135,19 +151,19 @@ struct ChaptersListView: View {
 }
 
 struct ContentView: View {
-    @ObservedObject var video: VideoInfo
+    @ObservedObject var appState: AppState
     
     var body: some View {
         VStack {
             ZStack {
-                VideoPlayer(player: video.player) {
-                    if video.asset != nil {
+                VideoPlayer(player: appState.player) {
+                    if appState.videoInfo.asset != nil {
                         Color.clear
                             .contentShape(Rectangle())
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .scaledToFill()
-                            .draggable(video.screenshotData, preview: {
-                                Image(nsImage: video.screenshotImage)
+                            .draggable(appState.screenshotData, preview: {
+                                Image(nsImage: appState.screenshotImage)
                             })
                     }
                     else {
@@ -156,29 +172,29 @@ struct ContentView: View {
                             .scaledToFill()
                     }
                 }
-                .disabled(video.asset == nil || video.exporting)
+                .disabled(appState.videoInfo.asset == nil || appState.exporting)
 
-                if video.exporting {
-                    ProgressView(video.exportMessage, value: video.exportProgress)
+                if appState.exporting {
+                    ProgressView(appState.exportMessage, value: appState.exportProgress)
                         .progressViewStyle(.linear)
                         .padding(50.0)
-                        .background(video.exportError ? .red : .blue)
+                        .background(appState.exportError ? .red : .blue)
                 }
             }
             HStack {
-                VideoInfoView(video: video).frame(maxHeight: .infinity)
-                ChaptersListView(video: video).frame(width: 350).frame(maxHeight: .infinity)
+                VideoInfoView(appState: appState).frame(maxHeight: .infinity)
+                ChaptersListView(appState: appState).frame(width: 350).frame(maxHeight: .infinity)
             }
             .fixedSize(horizontal: false, vertical: true)
-            .disabled(video.asset == nil || video.exporting)
+            .disabled(appState.videoInfo.asset == nil || appState.exporting)
         }
         .padding()
     }
 }
 
 struct ContentView_Previews: PreviewProvider {
-    static var video = VideoInfo()
+    static var appState = AppState()
     static var previews: some View {
-        ContentView(video: video)
+        ContentView(appState: appState)
     }
 }

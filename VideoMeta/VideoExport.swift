@@ -63,14 +63,16 @@ enum VideoExportError: Error {
 }
 
 actor VideoExport {
-    private var _videoInfo: VideoInfo
+    private var _appState: AppState
 
-    init(video: VideoInfo) {
-        self._videoInfo = video
+    init(appState: AppState) {
+        self._appState = appState
     }
 
     func export(to exportUrl: URL, progressHandler: (@MainActor (Float) -> Void)? = nil, completionHandler: (@MainActor () -> Void)? = nil, errorHandler: (@MainActor (String) -> Void)? = nil) async {
         do {
+            let videoInfo = await _appState.videoInfo
+
             // create temporary storage
             let temporaryUrl = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             FileManager.default.createFile(atPath: temporaryUrl.path(), contents: nil)
@@ -92,7 +94,7 @@ actor VideoExport {
             exportSession.outputFileType = .mov
             exportSession.shouldOptimizeForNetworkUse = true
             exportSession.canPerformMultiplePassesOverSourceMediaData = true
-            exportSession.metadata = newMovie.metadata
+            exportSession.metadata = await prepareMetadata(from: videoInfo)
 
             let progressTimer = Timer(timeInterval: 0.5, repeats: true) { timer in
                 switch exportSession.status {
@@ -119,16 +121,18 @@ actor VideoExport {
     }
 
     private func prepareNewMovie(at temporaryUrl: URL) async throws -> AVMutableMovie {
+        let videoInfo = await _appState.videoInfo
+        let subtitleFileUrl = await _appState.subtitleFileUrl
+        let replaceExistingSubtitle = await _appState.replaceExistingSubtitle
+        let subtitleTimeAdjustmentValue = await _appState.subtitleTimeAdjustmentValue
+
         // create movie objects
-        guard let assetUrl = _videoInfo.url else { throw VideoExportError.invalidAsset }
+        guard let assetUrl = videoInfo.url else { throw VideoExportError.invalidAsset }
         let sourceMovie = AVMutableMovie(url: assetUrl, options: [AVURLAssetPreferPreciseDurationAndTimingKey : true])
         guard let (tracks, sourceDuration) = try? await sourceMovie.load(.tracks, .duration) else { throw VideoExportError.failedLoadingAssetProperty }
 
         guard let newMovie = try? AVMutableMovie(settingsFrom: sourceMovie, options: [AVURLAssetPreferPreciseDurationAndTimingKey : true]) else { throw VideoExportError.failedCreatingNewMovie }
         newMovie.defaultMediaDataStorage = AVMediaDataStorage(url: temporaryUrl)
-
-        // prepare metadata
-        newMovie.metadata = prepareMetadata(from: _videoInfo)
 
         // find important tracks to keep
         var sourceTracks: [AVMovieTrack] = []
@@ -137,7 +141,7 @@ actor VideoExport {
             guard let format = try await track.load(.formatDescriptions).first else { throw VideoExportError.failedLoadingAssetProperty }
             let keep = (format.mediaType == .video && format.mediaSubType != .jpeg) ||
                        (format.mediaType == .audio) ||
-                       (format.mediaType == .subtitle && (!_videoInfo.replaceExistingSubtitle || _videoInfo.subtitleFileUrl == nil))
+                       (format.mediaType == .subtitle && (!replaceExistingSubtitle || subtitleFileUrl == nil))
             if keep {
                 guard let newTrack = newMovie.addMutableTrack(withMediaType: track.mediaType, copySettingsFrom: track) else { throw VideoExportError.failedCreatingNewTrack }
                 switch track.mediaType {
@@ -157,7 +161,7 @@ actor VideoExport {
         guard let videoTrack = try? await newMovie.loadTracks(withMediaType: .video).first else { throw VideoExportError.failedCreatingNewTrack }
         var chapterTrack: AVMutableMovieTrack? = nil
         var thumbnailTrack: AVMutableMovieTrack? = nil
-        if _videoInfo.chapters.count > 1 {
+        if videoInfo.chapters.count > 1 {
             chapterTrack = newMovie.addMutableTrack(withMediaType: .text, copySettingsFrom: nil)
             thumbnailTrack = newMovie.addMutableTrack(withMediaType: .video, copySettingsFrom: nil)
             if chapterTrack == nil || thumbnailTrack == nil { throw VideoExportError.failedCreatingNewTrack }
@@ -166,23 +170,24 @@ actor VideoExport {
         // only produce subtitle tracks when a new subtitle file was specified
         var subtitleTrack: AVMutableMovieTrack? = nil
         var subtitleParser: SubtitleParser? = nil
-        if _videoInfo.subtitleFileUrl != nil {
+        if subtitleFileUrl != nil {
             subtitleTrack = newMovie.addMutableTrack(withMediaType: .subtitle, copySettingsFrom: nil)
-            subtitleParser = SRTSubtitle(with: _videoInfo.subtitleFileUrl!)
             if subtitleTrack == nil { throw VideoExportError.failedCreatingNewTrack }
             subtitleTrack?.alternateGroupID = 2
-            let pattern = /_([a-z]{2}-[A-Z]{2})\.srt/       // match patterns like 'en-US' at the end of the file name
-            if let match = _videoInfo.subtitleFileUrl!.path().firstMatch(of: pattern) {
+
+            subtitleParser = try SRTSubtitle(fileUrl: subtitleFileUrl!, timeAdjust: subtitleTimeAdjustmentValue)
+            let pattern = /[-_ ]([a-z]{2}-[A-Z]{2})\.srt/       // match patterns like 'en-US' at the end of the file name
+            if let match = subtitleFileUrl!.path().firstMatch(of: pattern) {
                 subtitleTrack?.extendedLanguageTag = "\(match.1)"
             }
         }
 
         // process chapter definitions
         var newTimeline: CMTime = .zero
-        for (index, chapter) in _videoInfo.chapters.enumerated() {
-            let nextChapter = (index < _videoInfo.chapters.count-1 ? _videoInfo.chapters[index+1] : nil)
+        for (index, chapter) in videoInfo.chapters.enumerated() {
+            let nextChapter = (index < videoInfo.chapters.count-1 ? videoInfo.chapters[index+1] : nil)
             let chapterDuration = (nextChapter != nil ? nextChapter!.time - chapter.time : sourceDuration - chapter.time)
-            if chapter.keep || _videoInfo.chapters.count <= 1 {
+            if chapter.keep || videoInfo.chapters.count <= 1 {
                 let oldRange = CMTimeRange(start: chapter.time, duration: chapterDuration)
                 let newRange = CMTimeRange(start: newTimeline, duration: chapterDuration)
 
@@ -218,7 +223,6 @@ actor VideoExport {
                     }
                     else {
                         // when no subtitle line was found for current chapter range, fill entire range with an empty sample
-                        print("Adding empty sample from \(empty.startTime.seconds) to \(empty.endTime.seconds)")
                         try await appendSubtitleSample(to: subtitleTrack!, for: empty, on: CMTimeRange(start: empty.startTime, end: empty.endTime))
                     }
                 }
@@ -469,8 +473,9 @@ actor VideoExport {
         return sampleData
     }
 
-    private func prepareMetadata(from video: VideoInfo) -> [AVMetadataItem] {
+    private func prepareMetadata(from video: VideoInfo) async -> [AVMetadataItem] {
         var metadata: [AVMetadataItem] = []
+        let videoInfo = await _appState.videoInfo
 
         // metadata for poster
         if video.poster.size.width > 0 && video.poster.size.height > 0 {
@@ -490,7 +495,8 @@ actor VideoExport {
         // metadata for release date
         if video.releaseDate.count > 0 {
             let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd"
+            formatter.dateFormat = "yyyy'-'MM'-'dd"
+            formatter.timeZone = TimeZone(abbreviation: "UTC")
             if let date = formatter.date(from: video.releaseDate) {
                 metadata.append(createMetadata(for: .commonIdentifierCreationDate, in: .common, using: .commonKeyCreationDate, with: date))
                 metadata.append(createMetadata(for: .quickTimeMetadataYear, in: .quickTimeMetadata, using: .quickTimeMetadataKeyYear, with: date))
@@ -524,7 +530,7 @@ actor VideoExport {
         }
 
         // metadata for genres
-        let genres = _videoInfo.genre
+        let genres = videoInfo.genre
         if genres.count > 0 {
             metadata.append(createMetadata(for: .quickTimeMetadataGenre, in: .quickTimeMetadata, using: .quickTimeMetadataKeyGenre, with: genres))
             metadata.append(createMetadata(for: .iTunesMetadataUserGenre, in: .iTunes, using: .iTunesMetadataKeyUserGenre, with: genres))
@@ -555,11 +561,14 @@ actor VideoExport {
     }
 
     private func createMetadata(for identifier: AVMetadataIdentifier, in space: AVMetadataKeySpace, using key: AVMetadataKey, with dateValue: Date) -> AVMutableMetadataItem {
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = TimeZone(abbreviation: "UTC")
+
         let metaItem = AVMutableMetadataItem()
         metaItem.keySpace = space
         metaItem.key = key as NSString
         metaItem.identifier = identifier
-        metaItem.value = dateValue as NSDate
+        metaItem.value = formatter.string(from: dateValue) as NSString
         return metaItem
     }
 
