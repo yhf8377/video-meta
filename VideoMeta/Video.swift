@@ -114,19 +114,23 @@ class VideoInfo: ObservableObject {
     }
 
     @Published var poster = NSImage()
+    var identifier: String = ""
     var releaseDate: String = ""
     var title: String = ""
     var cast: String = ""
+    var genre: String = ""
     var description: String = ""
 
+    @Published var replaceExistingSubtitle: Bool = false
     private var _subtitleFileUrl: URL? = nil
     var subtitleFileUrl: URL? {
         get { return _subtitleFileUrl }
     }
     var subtitleFileName: String {
-        get { return self._subtitleFileUrl != nil ? self._subtitleFileUrl!.lastPathComponent : "" }
+        get { return self._subtitleFileUrl != nil ? self._subtitleFileUrl!.lastPathComponent : "<no subtitle file>" }
         set {
             _subtitleFileUrl = URL(fileURLWithPath: newValue)
+            replaceExistingSubtitle = true
             self.objectWillChange.send()
         }
     }

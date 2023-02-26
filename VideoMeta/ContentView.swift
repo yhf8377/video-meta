@@ -30,20 +30,24 @@ struct VideoInfoView: View {
                     }
                 VStack {
                     HStack {
+                        TextField("Identifier", text: $video.identifier).frame(width: 100)
                         TextField("Release Date", text: $video.releaseDate).frame(width: 100)
                         Spacer()
                     }
                     TextField("Title", text: $video.title)
                     TextField("Cast", text: $video.cast)
+                    TextField("Genre", text: $video.genre)
                     ScrollView {
                         TextField("Description", text: $video.description, axis: .vertical)
-                            .lineLimit(50, reservesSpace: false)
+                            .lineLimit(50, reservesSpace: true)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
-                    .frame(maxHeight: 120)
+                    .frame(maxHeight: 70.0)
                     Spacer()
+                    Text(video.subtitleFileName)
                     HStack {
-                        Text(video.subtitleFileName)
+                        Toggle("Replace existing subtitle", isOn: $video.replaceExistingSubtitle)
+                            .disabled(video.subtitleFileUrl == nil)
                         Spacer()
                         Button("Add Subtitle") {
                             let panel = NSOpenPanel()
@@ -64,7 +68,7 @@ struct VideoInfoView: View {
                             })
                         }
                     }
-                }
+                }.frame(maxHeight: 300.0)
             }
         }
     }
@@ -95,6 +99,19 @@ struct ChaptersListView: View {
                             TextField("time", value: $chapter.time, formatter: timeFormatter)
                                 .disabled(true)
                             TextField("chapter title", text: $chapter.title)
+                                .onSubmit {
+                                    var genres: Set<String> = []
+                                    if self.video.genre.count > 0 {
+                                        genres = genres.union(self.video.genre.components(separatedBy: "/").map { return $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+                                    }
+                                    for chapter in self.video.chapters {
+                                        if chapter.title.count > 0 {
+                                            let chapterTitles = chapter.title.components(separatedBy: "/").map { return $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                            genres = genres.union(chapterTitles)
+                                        }
+                                    }
+                                    self.video.genre = genres.joined(separator: "/")
+                                }
                             Toggle("Export", isOn: $chapter.keep)
                                 .frame(maxWidth: .infinity, alignment: .trailing)
                         }
@@ -112,7 +129,7 @@ struct ChaptersListView: View {
                     }).disabled(video.asset == nil || video.selectedChapterIndex == nil || video.selectedChapterIndex == 0)
                     Spacer()
                 }
-            }.frame(maxHeight: .infinity)
+            }
         }
     }
 }
@@ -127,6 +144,7 @@ struct ContentView: View {
                     if video.asset != nil {
                         Color.clear
                             .contentShape(Rectangle())
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .scaledToFill()
                             .draggable(video.screenshotData, preview: {
                                 Image(nsImage: video.screenshotImage)

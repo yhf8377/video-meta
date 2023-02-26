@@ -16,11 +16,13 @@
       "size" : "32x32"
     },
     {
+      "filename" : "Treetog-I-Videos.64.png",
       "idiom" : "mac",
       "scale" : "2x",
       "size" : "32x32"
     },
     {
+      "filename" : "Treetog-I-Videos.128.png",
       "idiom" : "mac",
       "scale" : "1x",
       "size" : "128x128"
@@ -31,6 +33,7 @@
       "size" : "128x128"
     },
     {
+      "filename" : "Treetog-I-Videos.256.png",
       "idiom" : "mac",
       "scale" : "1x",
       "size" : "256x256"
