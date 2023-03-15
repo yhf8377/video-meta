@@ -90,7 +90,7 @@ struct VideoInfo {
     var genre: String = ""
     var description: String = ""
 
-    var chapters: [Chapter] = [Chapter(time: .zero, title: "", image: NSImage(), keep: true)]
+    var chapters: [Chapter] = []
 
     init() {
         self.url = nil
@@ -120,10 +120,9 @@ struct VideoInfo {
         self.cast = ""
         self.genre = ""
         self.description = ""
-        self.chapters = []
 
         await asyncLoadVideoMetadata(from: asset)
-        await asyncLoadVideoChapters(from: asset)
+        self.chapters = await asyncLoadVideoChapters(from: asset)
     }
 
     private mutating func asyncLoadVideoMetadata(from asset: AVAsset) async {
@@ -181,10 +180,10 @@ struct VideoInfo {
         }
     }
 
-    private mutating func asyncLoadVideoChapters(from asset: AVAsset) async {
+    private mutating func asyncLoadVideoChapters(from asset: AVAsset) async -> [Chapter] {
         var chapters: [Chapter] = []
         do {
-            guard let language = try await asset.load(.availableChapterLocales).first?.language.languageCode?.identifier else { return }
+            guard let language = try await asset.load(.availableChapterLocales).first?.language.languageCode?.identifier else { return chapters }
             let chapterGroups = try await asset.loadChapterMetadataGroups(bestMatchingPreferredLanguages: [language])
             chapters = await chapterGroups.asyncMap { group in
                 var chapter = Chapter(time: group.timeRange.start, title: "", image: NSImage())
@@ -203,11 +202,9 @@ struct VideoInfo {
         }
         catch {
             print("Failed to load chapters from asset: \(error)")
-            chapters = []
         }
 
-        if chapters.count == 0 { chapters.append(Chapter(time: .zero, title: "", image: NSImage())) }
-        self.chapters = chapters
+        return chapters
     }
 
     private func getMetadataStringValue(from metadata: [AVMetadataItem], with key: AVMetadataKey, in keySpace: AVMetadataKeySpace) async -> String? {
@@ -321,7 +318,13 @@ struct VideoInfo {
         self.selectedChapterID = nil
 
         Task {
-            let videoInfo = await VideoInfo(url: url)
+            var videoInfo = await VideoInfo(url: url)
+            if videoInfo.chapters.count == 0 {
+                let screenshot = await self.asyncTakeScreenshot(from: videoInfo.asset, at: .zero) ?? NSImage()
+                let chapter = Chapter(time: .zero, title: "", image: screenshot)
+                videoInfo.chapters.append(chapter)
+            }
+
             DispatchQueue.main.async {
                 self.videoInfo = videoInfo
 
@@ -340,7 +343,7 @@ struct VideoInfo {
 
         // take screenshot if one was not provided
         if image == nil {
-            let screenshot = await self.asyncTakeScreenshot(at: time) ?? NSImage()
+            let screenshot = await self.asyncTakeScreenshot(from: self.videoInfo.asset, at: time) ?? NSImage()
             return Chapter(time: time, title: title, image: screenshot)
         }
         else {
@@ -357,7 +360,7 @@ struct VideoInfo {
         if time != self._screenshotTime {
             self._screenshotTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { timer in
                 Task {
-                    let image = await self.asyncTakeScreenshot(at: time)
+                    let image = await self.asyncTakeScreenshot(from: self.videoInfo.asset, at: time)
                     DispatchQueue.main.async {
                         self._screenshotTime = time
                         self._screenshotImage = image
@@ -367,10 +370,10 @@ struct VideoInfo {
         }
     }
 
-    private func asyncTakeScreenshot(at time: CMTime) async -> NSImage? {
-        guard let asset = self.videoInfo.asset else { return nil }
+    private func asyncTakeScreenshot(from asset: AVAsset?, at time: CMTime) async -> NSImage? {
+        if asset == nil { return nil }
 
-        let generator = AVAssetImageGenerator(asset: asset)
+        let generator = AVAssetImageGenerator(asset: asset!)
         let imageSize = CGSize(width: 120.0, height: 90.0)
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = imageSize

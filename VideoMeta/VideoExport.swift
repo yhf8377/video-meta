@@ -129,22 +129,24 @@ actor VideoExport {
         // create movie objects
         guard let assetUrl = videoInfo.url else { throw VideoExportError.invalidAsset }
         let sourceMovie = AVMutableMovie(url: assetUrl, options: [AVURLAssetPreferPreciseDurationAndTimingKey : true])
-        guard let (tracks, sourceDuration) = try? await sourceMovie.load(.tracks, .duration) else { throw VideoExportError.failedLoadingAssetProperty }
+        guard let (sourceTracks, sourceDuration) = try? await sourceMovie.load(.tracks, .duration) else { throw VideoExportError.failedLoadingAssetProperty }
+        let sourceRange = CMTimeRange(start: .zero, duration: sourceMovie.duration)
 
         guard let newMovie = try? AVMutableMovie(settingsFrom: sourceMovie, options: [AVURLAssetPreferPreciseDurationAndTimingKey : true]) else { throw VideoExportError.failedCreatingNewMovie }
         newMovie.defaultMediaDataStorage = AVMediaDataStorage(url: temporaryUrl)
 
         // find important tracks to keep
-        var sourceTracks: [AVMovieTrack] = []
-        var newTracks: [AVMutableMovieTrack] = []
-        for track in tracks {
-            guard let format = try await track.load(.formatDescriptions).first else { throw VideoExportError.failedLoadingAssetProperty }
+        var newMovieTracks: [AVMutableMovieTrack: AVAssetTrack] = [:]
+        for sourceTrack in sourceTracks {
+            guard let format = try await sourceTrack.load(.formatDescriptions).first else { throw VideoExportError.failedLoadingAssetProperty }
             let keep = (format.mediaType == .video && format.mediaSubType != .jpeg) ||
                        (format.mediaType == .audio) ||
                        (format.mediaType == .subtitle && (!replaceExistingSubtitle || subtitleFileUrl == nil))
             if keep {
-                guard let newTrack = newMovie.addMutableTrack(withMediaType: track.mediaType, copySettingsFrom: track) else { throw VideoExportError.failedCreatingNewTrack }
-                switch track.mediaType {
+                guard let newTrack = newMovie.addMutableTrack(withMediaType: sourceTrack.mediaType, copySettingsFrom: sourceTrack) else { throw VideoExportError.failedCreatingNewTrack }
+                newMovieTracks[newTrack] = sourceTrack
+
+                switch sourceTrack.mediaType {
                 case .audio:
                     newTrack.alternateGroupID = 1
                 case .subtitle:
@@ -152,108 +154,112 @@ actor VideoExport {
                 default:
                     newTrack.alternateGroupID = 0
                 }
-                sourceTracks.append(track)
-                newTracks.append(newTrack)
             }
         }
 
-        // only produce chapter tracks when there are more than just the default chapter that was created automatically
-        guard let videoTrack = try? await newMovie.loadTracks(withMediaType: .video).first else { throw VideoExportError.failedCreatingNewTrack }
-        var chapterTrack: AVMutableMovieTrack? = nil
-        var thumbnailTrack: AVMutableMovieTrack? = nil
-        if videoInfo.chapters.count > 1 {
-            chapterTrack = newMovie.addMutableTrack(withMediaType: .text, copySettingsFrom: nil)
-            thumbnailTrack = newMovie.addMutableTrack(withMediaType: .video, copySettingsFrom: nil)
-            if chapterTrack == nil || thumbnailTrack == nil { throw VideoExportError.failedCreatingNewTrack }
+        // add subtitle and chapter tracks as needed
+        var optionalSubtitleTrack: AVMutableMovieTrack? = nil
+        if subtitleFileUrl != nil {
+            optionalSubtitleTrack = newMovie.addMutableTrack(withMediaType: .subtitle, copySettingsFrom: nil)
         }
 
-        // only produce subtitle tracks when a new subtitle file was specified
-        var subtitleTrack: AVMutableMovieTrack? = nil
-        var subtitleParser: SubtitleParser? = nil
-        if subtitleFileUrl != nil {
-            subtitleTrack = newMovie.addMutableTrack(withMediaType: .subtitle, copySettingsFrom: nil)
-            if subtitleTrack == nil { throw VideoExportError.failedCreatingNewTrack }
-            subtitleTrack?.alternateGroupID = 2
+        var optionalChapterTrack: AVMutableMovieTrack? = nil
+        var optionalThumbnailTrack: AVMutableMovieTrack? = nil
+        if videoInfo.chapters.count > 1 {
+            optionalChapterTrack = newMovie.addMutableTrack(withMediaType: .text, copySettingsFrom: nil)
+            optionalThumbnailTrack = newMovie.addMutableTrack(withMediaType: .video, copySettingsFrom: nil)
+        }
 
-            subtitleParser = try SRTSubtitle(fileUrl: subtitleFileUrl!, timeAdjust: subtitleTimeAdjustmentValue)
+        // add samples from preserved tracks
+        for (newTrack, sourceTrack) in newMovieTracks {
+            try newTrack.insertTimeRange(sourceRange, of: sourceTrack, at: .zero, copySampleData: false)
+        }
+
+        // prepare subtitile track
+        if subtitleFileUrl != nil {
+            guard let subtitleTrack = optionalSubtitleTrack else { throw VideoExportError.failedCreatingNewTrack }
+            subtitleTrack.alternateGroupID = 2
+
+            let subtitleParser = try SRTSubtitle(fileUrl: subtitleFileUrl!, timeAdjust: subtitleTimeAdjustmentValue)
             let pattern = /[-_ ]([a-z]{2}-[A-Z]{2})\.srt/       // match patterns like 'en-US' at the end of the file name
             if let match = subtitleFileUrl!.path().firstMatch(of: pattern) {
-                subtitleTrack?.extendedLanguageTag = "\(match.1)"
+                subtitleTrack.extendedLanguageTag = "\(match.1)"
             }
+
+            let subtitleLines = subtitleParser.getLines(for: sourceRange)
+            var empty = SubtitleLine(startTime: .zero, endTime: sourceMovie.duration, text: "")
+            if subtitleLines.count > 0 {
+                for (index, line) in subtitleLines.enumerated() {
+                    empty.endTime = line.startTime
+                    // fill leading gap with an empty sample
+                    try await appendSubtitleSample(to: subtitleTrack, for: empty, on: CMTimeRange(start: empty.startTime, end: empty.endTime))
+                    // write current subtitle line sample
+                    try await appendSubtitleSample(to: subtitleTrack, for: line, on: CMTimeRange(start: line.startTime, end: line.endTime))
+                    empty.startTime = line.endTime
+                    if (index == subtitleLines.endIndex - 1) {
+                        // fill trailing gap with an empty sample
+                        empty.endTime = sourceMovie.duration
+                        try await appendSubtitleSample(to: subtitleTrack, for: empty, on: CMTimeRange(start: empty.startTime, end: empty.endTime))
+                    }
+                }
+            }
+            else {
+                // when no subtitle line was found for current chapter range, fill entire range with an empty sample
+                try await appendSubtitleSample(to: subtitleTrack, for: empty, on: CMTimeRange(start: empty.startTime, end: empty.endTime))
+            }
+
+            subtitleTrack.insertMediaTimeRange(sourceRange, into: sourceRange)
         }
 
         // process chapter definitions
-        var newTimeline: CMTime = .zero
-        for (index, chapter) in videoInfo.chapters.enumerated() {
-            let nextChapter = (index < videoInfo.chapters.count-1 ? videoInfo.chapters[index+1] : nil)
-            let chapterDuration = (nextChapter != nil ? nextChapter!.time - chapter.time : sourceDuration - chapter.time)
-            if chapter.keep || videoInfo.chapters.count <= 1 {
-                let oldRange = CMTimeRange(start: chapter.time, duration: chapterDuration)
-                let newRange = CMTimeRange(start: newTimeline, duration: chapterDuration)
+        // only produce chapter tracks when there are more than just the default chapter that was created automatically
+        if videoInfo.chapters.count > 1 {
+            guard let videoTrack = try? await newMovie.loadTracks(withMediaType: .video).first else { throw VideoExportError.failedCreatingNewTrack }
+            guard let chapterTrack = optionalChapterTrack else { throw VideoExportError.failedCreatingNewTrack }
+            guard let thumbnailTrack = optionalThumbnailTrack else { throw VideoExportError.failedCreatingNewTrack }
 
-                // insert matching time range from source movie
-                for (index, sourceTrack) in sourceTracks.enumerated() {
-                    let newTrack = newTracks[index]
-                    try newTrack.insertTimeRange(oldRange, of: sourceTrack, at: newRange.start, copySampleData: false)
+            // remove unwanted chapters
+            for (index, chapter) in videoInfo.chapters.enumerated().reversed() {
+                if !chapter.keep {
+                    let nextChapter = (index < videoInfo.chapters.count-1 ? videoInfo.chapters[index+1] : nil)
+                    let chapterDuration = (nextChapter != nil ? nextChapter!.time - chapter.time : sourceDuration - chapter.time)
+                    let chapterRange = CMTimeRange(start: chapter.time, duration: chapterDuration)
+                    newMovie.removeTimeRange(chapterRange)
                 }
-
-                // add to chapter track
-                if chapterTrack != nil { try await appendChapterSample(to: chapterTrack!, for: chapter, on: newRange) }
-                if thumbnailTrack != nil { try await appendThumbnailSample(to: thumbnailTrack!, for: chapter, on: newRange) }
-
-                // add to subtitle track
-                if subtitleTrack != nil && subtitleParser != nil {
-                    let offset = newRange.start - oldRange.start
-                    let subtitleLines = subtitleParser!.getLines(for: oldRange, withOffset: offset)
-                    var empty = SubtitleLine(startTime: newRange.start, endTime: newRange.end, text: "")
-                    if subtitleLines.count > 0 {
-                        for (index, line) in subtitleLines.enumerated() {
-                            empty.endTime = line.startTime
-                            // fill leading gap with an empty sample
-                            try await appendSubtitleSample(to: subtitleTrack!, for: empty, on: CMTimeRange(start: empty.startTime, end: empty.endTime))
-                            // write current subtitle line sample
-                            try await appendSubtitleSample(to: subtitleTrack!, for: line, on: CMTimeRange(start: line.startTime, end: line.endTime))
-                            empty.startTime = line.endTime
-                            if (index == subtitleLines.endIndex - 1) {
-                                // fill trailing gap with an empty sample
-                                empty.endTime = newRange.end
-                                try await appendSubtitleSample(to: subtitleTrack!, for: empty, on: CMTimeRange(start: empty.startTime, end: empty.endTime))
-                            }
-                        }
-                    }
-                    else {
-                        // when no subtitle line was found for current chapter range, fill entire range with an empty sample
-                        try await appendSubtitleSample(to: subtitleTrack!, for: empty, on: CMTimeRange(start: empty.startTime, end: empty.endTime))
-                    }
-                }
-
-                // ready timeline for next iteration
-                newTimeline = newTimeline + chapterDuration
             }
-        }
 
-        if chapterTrack != nil {
-            chapterTrack!.insertMediaTimeRange(CMTimeRange(start: .zero, duration: newTimeline), into: CMTimeRange(start: .zero, duration: newTimeline))
-            videoTrack.addTrackAssociation(to: chapterTrack!, type: .chapterList)
-            chapterTrack!.isEnabled = false
-        }
+            // process chapter definitions
+            var newTimeline: CMTime = .zero
+            for (index, chapter) in videoInfo.chapters.enumerated() {
+                if chapter.keep {
+                    let nextChapter = (index < videoInfo.chapters.count-1 ? videoInfo.chapters[index+1] : nil)
+                    let chapterDuration = (nextChapter != nil ? nextChapter!.time - chapter.time : sourceDuration - chapter.time)
+                    let chapterRange = CMTimeRange(start: newTimeline, duration: chapterDuration)
+                    try await appendChapterSample(to: chapterTrack, for: chapter, on: chapterRange)
+                    try await appendThumbnailSample(to: thumbnailTrack, for: chapter, on: chapterRange)
 
-        if thumbnailTrack != nil {
-            thumbnailTrack!.insertMediaTimeRange(CMTimeRange(start: .zero, duration: newTimeline), into: CMTimeRange(start: .zero, duration: newTimeline))
-            videoTrack.addTrackAssociation(to: thumbnailTrack!, type: .chapterList)
-            thumbnailTrack!.isEnabled = false
-        }
+                    newTimeline = newTimeline + chapterDuration
+                }
+            }
 
-        if subtitleTrack != nil {
-            subtitleTrack!.insertMediaTimeRange(CMTimeRange(start: .zero, duration: newTimeline), into: CMTimeRange(start: .zero, duration: newTimeline))
+            let newMovieTimeRange = CMTimeRange(start: .zero, duration: newTimeline)
+
+            chapterTrack.insertMediaTimeRange(newMovieTimeRange, into: newMovieTimeRange)
+            videoTrack.addTrackAssociation(to: chapterTrack, type: .chapterList)
+            chapterTrack.isEnabled = false
+
+            thumbnailTrack.insertMediaTimeRange(newMovieTimeRange, into: newMovieTimeRange)
+            videoTrack.addTrackAssociation(to: thumbnailTrack, type: .chapterList)
+            thumbnailTrack.isEnabled = false
         }
 
         return newMovie
     }
 
     private func appendChapterSample(to track: AVMutableMovieTrack, for chapter: Chapter, on timeRange: CMTimeRange) async throws {
+        let text = chapter.title.count > 0 ? chapter.title : "chapter"
         guard let formatDesc = try? createTextFormatDescription() else { throw VideoExportError.failedCreatingFormatDescription }
-        guard let sampleData = try? createSampleData(from: chapter.title) else { throw VideoExportError.failedPreparingSampleData }
+        guard let sampleData = try? createSampleData(from: text) else { throw VideoExportError.failedPreparingSampleData }
         try appendNewSample(from: sampleData, format: formatDesc, timing: timeRange, to: track)
     }
 

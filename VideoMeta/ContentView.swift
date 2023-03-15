@@ -39,7 +39,7 @@ struct VideoInfoView: View {
                     TextField("Genre", text: $appState.videoInfo.genre)
                     ScrollView {
                         TextField("Description", text: $appState.videoInfo.description, axis: .vertical)
-                            .lineLimit(50, reservesSpace: true)
+                            .lineLimit(50, reservesSpace: false)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                     .frame(maxHeight: 70.0)
@@ -86,7 +86,7 @@ struct ChaptersListView: View {
     var body: some View {
         GroupBox(label: Label("Chapter Info", systemImage: "photo.on.rectangle")) {
             VStack {
-                List($appState.videoInfo.chapters, selection: $appState.selectedChapterID) { $chapter in
+                List($appState.videoInfo.chapters, id: \.id, selection: $appState.selectedChapterID) { $chapter in
                     HStack {
                         Image(nsImage: chapter.image)
                             .resizable()
@@ -141,7 +141,10 @@ struct ChaptersListView: View {
                     }).disabled(appState.videoInfo.asset == nil)
                     Button("-", action: {
                         guard let index = appState.selectedChapterIndex else { return }
-                        if index > 0 && index < appState.videoInfo.chapters.endIndex { appState.videoInfo.chapters.remove(at: index) }
+                        if index > 0 && index < appState.videoInfo.chapters.endIndex {
+                            appState.selectedChapterID = nil
+                            appState.videoInfo.chapters.remove(at: index)
+                        }
                     }).disabled(appState.videoInfo.asset == nil || appState.selectedChapterID == nil || appState.selectedChapterIndex == 0)
                     Spacer()
                 }
